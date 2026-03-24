@@ -1,0 +1,7 @@
+<Solution>
+  <Project Path="ssh.client/ssh.client.esproj">
+    <Build />
+    <Deploy />
+  </Project>
+  <Project Path="ssh.Server/ssh.Server.csproj" />
+</Solution>
