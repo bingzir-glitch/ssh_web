@@ -9,12 +9,24 @@
     <SpaProxyServerUrl>https://localhost:50071</SpaProxyServerUrl>
   </PropertyGroup>
 
+  <PropertyGroup Condition="'$(Configuration)' == 'Release'">
+    <DebugType>none</DebugType>
+    <DebugSymbols>false</DebugSymbols>
+  </PropertyGroup>
+
   <ItemGroup>
-    <PackageReference Include="Microsoft.AspNetCore.OpenApi" Version="10.0.5" />
     <PackageReference Include="Microsoft.AspNetCore.SpaProxy">
       <Version>10.*-*</Version>
     </PackageReference>
     <PackageReference Include="SSH.NET" Version="2025.1.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Update="appsettings.Development.json" CopyToPublishDirectory="Never" />
+    <None Update="dotnet-tools.json" CopyToPublishDirectory="Never" />
+    <Content Update="appsettings.Development.json" CopyToOutputDirectory="Never" CopyToPublishDirectory="Never" />
+    <Content Update="dotnet-tools.json" CopyToOutputDirectory="Never" CopyToPublishDirectory="Never" />
+    <Content Update="wwwroot\.gitkeep" CopyToPublishDirectory="Never" />
   </ItemGroup>
 
   <ItemGroup>

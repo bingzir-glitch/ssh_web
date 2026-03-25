@@ -27,6 +27,8 @@ const terminalPanel = ref(null)
 const terminalToolbar = ref(null)
 const terminalShell = ref(null)
 const fileTableWrap = ref(null)
+const uploadFilesInput = ref(null)
+const uploadDirectoryInput = ref(null)
 
 const status = ref('idle')
 const statusMessage = ref('远程链路待命。')
@@ -39,6 +41,14 @@ const parentDirectory = ref(null)
 const fileEntries = ref([])
 const filesLoading = ref(false)
 const fileActionPending = ref(false)
+const fileUploadPending = ref(false)
+const fileDropActive = ref(false)
+const fileUploadMessage = ref('')
+const fileUploadProgress = ref(0)
+const fileUploadTransferred = ref(0)
+const fileUploadTotal = ref(0)
+const fileUploadStage = ref('idle')
+const fileUploadSpeed = ref(0)
 const fileError = ref('')
 
 const themeMode = ref(loadTheme())
@@ -66,6 +76,11 @@ let closingReason = ''
 let disconnectRequested = false
 let connectAbortController = null
 let resizeFrame = 0
+let fileDragDepth = 0
+let activeUploadRequest = null
+let activeUploadProgressTimer = 0
+let lastUploadProgressAt = 0
+let lastUploadProgressWritten = 0
 // 用递增请求号丢弃过期响应，避免快速切目录时旧结果覆盖新结果。
 let latestFileRequestId = 0
 let activeConnectionKey = ''
@@ -88,10 +103,41 @@ const canBrowseFiles = computed(() => {
 })
 
 const isConnected = computed(() => socketState.value === WebSocket.OPEN)
+const isFileBusy = computed(() => filesLoading.value || fileActionPending.value || fileUploadPending.value)
 
 const directoryLabel = computed(() => currentDirectory.value || '未加载目录')
 
 const themeToggleLabel = computed(() => (themeMode.value === 'dark' ? '日间模式' : '夜间模式'))
+const fileUploadProgressPercent = computed(() => `${Math.round(fileUploadProgress.value)}%`)
+const fileUploadProgressDetail = computed(() => {
+  if (!fileUploadTotal.value) {
+    return ''
+  }
+
+  return `${formatFileSize(fileUploadTransferred.value)} / ${formatFileSize(fileUploadTotal.value)}`
+})
+const fileUploadSpeedLabel = computed(() => {
+  return fileUploadSpeed.value > 0 ? `${formatTransferSpeed(fileUploadSpeed.value)}` : ''
+})
+const fileUploadStageLabel = computed(() => {
+  if (fileUploadStage.value === 'syncing') {
+    return '远端写入中'
+  }
+
+  if (fileUploadStage.value === 'sending') {
+    return '上传中'
+  }
+
+  return fileUploadMessage.value || '正在上传文件...'
+})
+
+const fileDropHint = computed(() => {
+  if (fileUploadPending.value) {
+    return fileUploadStageLabel.value
+  }
+
+  return `拖动文件或文件夹到这里，自动上传到 ${directoryLabel.value}`
+})
 
 const savedConnectionsSummary = computed(() => {
   return savedConnections.value.length > 0
@@ -116,6 +162,7 @@ onMounted(() => {
   initializeTerminal()
   window.addEventListener('pointerdown', handleWindowPointerDown)
   window.addEventListener('keydown', handleGlobalKeydown)
+  window.addEventListener('beforeunload', handleBeforeUnload)
 
   void bootstrapPage()
 })
@@ -131,8 +178,17 @@ onBeforeUnmount(() => {
   window.removeEventListener('resize', scheduleTerminalLayout)
   window.removeEventListener('pointerdown', handleWindowPointerDown)
   window.removeEventListener('keydown', handleGlobalKeydown)
+  window.removeEventListener('beforeunload', handleBeforeUnload)
+  activeUploadRequest?.abort()
+  activeUploadRequest = null
+  stopUploadProgressPolling()
   terminal?.dispose()
 })
+
+function handleBeforeUnload() {
+  activeUploadRequest?.abort()
+  stopUploadProgressPolling()
+}
 
 function loadProfile() {
   let saved
@@ -1052,6 +1108,439 @@ function buildConnectionPayload() {
   }
 }
 
+function triggerFileUpload() {
+  if (isFileBusy.value) {
+    return
+  }
+
+  uploadFilesInput.value?.click()
+}
+
+function triggerDirectoryUpload() {
+  if (isFileBusy.value) {
+    return
+  }
+
+  uploadDirectoryInput.value?.click()
+}
+
+async function handleFileInputChange(event) {
+  const input = event.target
+  const files = Array.from(input?.files ?? [])
+  if (input) {
+    input.value = ''
+  }
+
+  if (!files.length) {
+    return
+  }
+
+  const batch = buildUploadBatchFromFiles(files)
+  await uploadFileBatch(batch)
+}
+
+async function handleDirectoryInputChange(event) {
+  const input = event.target
+  const files = Array.from(input?.files ?? [])
+  if (input) {
+    input.value = ''
+  }
+
+  if (!files.length) {
+    return
+  }
+
+  const batch = buildUploadBatchFromFiles(files, { preferWebkitRelativePath: true })
+  await uploadFileBatch(batch)
+}
+
+function handleFileDragEnter(event) {
+  if (!hasTransferFiles(event.dataTransfer)) {
+    return
+  }
+
+  event.preventDefault()
+  fileDragDepth += 1
+  fileDropActive.value = true
+}
+
+function handleFileDragOver(event) {
+  if (!hasTransferFiles(event.dataTransfer)) {
+    return
+  }
+
+  event.preventDefault()
+  if (event.dataTransfer) {
+    event.dataTransfer.dropEffect = 'copy'
+  }
+
+  fileDropActive.value = true
+}
+
+function handleFileDragLeave(event) {
+  if (!hasTransferFiles(event.dataTransfer)) {
+    return
+  }
+
+  event.preventDefault()
+  fileDragDepth = Math.max(0, fileDragDepth - 1)
+  if (fileDragDepth === 0) {
+    fileDropActive.value = false
+  }
+}
+
+async function handleFileDrop(event) {
+  if (!hasTransferFiles(event.dataTransfer)) {
+    return
+  }
+
+  event.preventDefault()
+  fileDragDepth = 0
+  fileDropActive.value = false
+
+  const batch = await collectUploadBatchFromDataTransfer(event.dataTransfer)
+  await uploadFileBatch(batch)
+}
+
+function hasTransferFiles(dataTransfer) {
+  if (!dataTransfer) {
+    return false
+  }
+
+  return Array.from(dataTransfer.types ?? []).includes('Files')
+}
+
+async function collectUploadBatchFromDataTransfer(dataTransfer) {
+  const items = Array.from(dataTransfer?.items ?? [])
+  const entries = items
+    .map(item => (typeof item.webkitGetAsEntry === 'function' ? item.webkitGetAsEntry() : null))
+    .filter(Boolean)
+
+  if (entries.length > 0) {
+    const collectedEntries = await Promise.all(entries.map(entry => collectUploadEntry(entry)))
+    const batch = mergeUploadBatches(collectedEntries)
+
+    if (batch.files.length > 0 || batch.directories.length > 0) {
+      return batch
+    }
+  }
+
+  return buildUploadBatchFromFiles(Array.from(dataTransfer?.files ?? []), {
+    preferWebkitRelativePath: true,
+  })
+}
+
+async function collectUploadEntry(entry, parentPath = '') {
+  if (!entry) {
+    return createUploadBatch()
+  }
+
+  if (entry.isFile) {
+    const file = await readEntryFile(entry)
+    const relativePath = sanitizeRelativeUploadPath(parentPath ? `${parentPath}/${file.name}` : file.name)
+
+    return {
+      files: [{ file, relativePath }],
+      directories: buildDirectoryChain(relativePath),
+    }
+  }
+
+  if (entry.isDirectory) {
+    const nextPath = sanitizeRelativeUploadPath(parentPath ? `${parentPath}/${entry.name}` : entry.name)
+    const children = await readDirectoryEntries(entry)
+    const childBatches = await Promise.all(children.map(child => collectUploadEntry(child, nextPath)))
+    const batch = mergeUploadBatches(childBatches)
+    batch.directories.push(nextPath)
+    return dedupeUploadBatch(batch)
+  }
+
+  return createUploadBatch()
+}
+
+function readEntryFile(entry) {
+  return new Promise((resolve, reject) => {
+    entry.file(resolve, reject)
+  })
+}
+
+async function readDirectoryEntries(directoryEntry) {
+  const reader = directoryEntry.createReader()
+  const entries = []
+
+  while (true) {
+    const chunk = await new Promise((resolve, reject) => {
+      reader.readEntries(resolve, reject)
+    })
+
+    if (!chunk.length) {
+      break
+    }
+
+    entries.push(...chunk)
+  }
+
+  return entries
+}
+
+function buildUploadBatchFromFiles(files, options = {}) {
+  const { preferWebkitRelativePath = false } = options
+  const batch = createUploadBatch()
+
+  for (const file of files) {
+    const rawPath = preferWebkitRelativePath
+      ? file.webkitRelativePath || file.name
+      : file.name
+    const relativePath = sanitizeRelativeUploadPath(rawPath)
+
+    batch.files.push({ file, relativePath })
+    batch.directories.push(...buildDirectoryChain(relativePath))
+  }
+
+  return dedupeUploadBatch(batch)
+}
+
+function createUploadBatch() {
+  return {
+    files: [],
+    directories: [],
+  }
+}
+
+function mergeUploadBatches(batches) {
+  const merged = createUploadBatch()
+
+  for (const batch of batches) {
+    merged.files.push(...(batch?.files ?? []))
+    merged.directories.push(...(batch?.directories ?? []))
+  }
+
+  return dedupeUploadBatch(merged)
+}
+
+function dedupeUploadBatch(batch) {
+  const directories = Array.from(new Set(
+    (batch.directories ?? [])
+      .map(path => sanitizeRelativeUploadPath(path))
+      .filter(Boolean),
+  ))
+
+  const files = []
+  const seenPaths = new Set()
+
+  for (const entry of batch.files ?? []) {
+    const relativePath = sanitizeRelativeUploadPath(entry.relativePath)
+    if (!relativePath || seenPaths.has(relativePath)) {
+      continue
+    }
+
+    seenPaths.add(relativePath)
+    files.push({
+      file: entry.file,
+      relativePath,
+    })
+  }
+
+  return {
+    files,
+    directories,
+  }
+}
+
+function buildDirectoryChain(relativePath) {
+  const normalizedPath = sanitizeRelativeUploadPath(relativePath)
+  const segments = normalizedPath.split('/').slice(0, -1)
+  const directories = []
+
+  for (let index = 0; index < segments.length; index += 1) {
+    directories.push(segments.slice(0, index + 1).join('/'))
+  }
+
+  return directories
+}
+
+function sanitizeRelativeUploadPath(path) {
+  const segments = String(path ?? '')
+    .replaceAll('\\', '/')
+    .split('/')
+    .map(segment => segment.trim())
+    .filter(segment => segment && segment !== '.' && segment !== '..')
+
+  return segments.join('/')
+}
+
+async function uploadFileBatch(batch) {
+  closeFileContextMenu()
+
+  if (isFileBusy.value) {
+    return
+  }
+
+  if (!canBrowseFiles.value) {
+    fileError.value = '请先填写主机、用户名和密码。'
+    return
+  }
+
+  const normalizedBatch = dedupeUploadBatch(batch)
+  if (!normalizedBatch.files.length && !normalizedBatch.directories.length) {
+    return
+  }
+
+  fileUploadPending.value = true
+  fileError.value = ''
+  fileUploadMessage.value = `正在上传 ${normalizedBatch.files.length} 个文件...`
+  fileUploadStage.value = 'sending'
+  fileUploadProgress.value = 0
+  fileUploadTransferred.value = 0
+  fileUploadTotal.value = normalizedBatch.files.reduce((total, entry) => total + (entry.file?.size ?? 0), 0)
+  fileUploadSpeed.value = 0
+
+  try {
+    const formData = new FormData()
+    const connectionPayload = buildConnectionPayload()
+    const uploadId = createConnectionId()
+    formData.append('host', connectionPayload.host)
+    formData.append('port', String(connectionPayload.port))
+    formData.append('username', connectionPayload.username)
+    formData.append('password', connectionPayload.password ?? '')
+    formData.append('path', normalizeDirectoryPath(currentDirectory.value || '/'))
+    formData.append('uploadId', uploadId)
+
+    for (const directory of normalizedBatch.directories) {
+      formData.append('directories', directory)
+    }
+
+    for (const entry of normalizedBatch.files) {
+      formData.append('files', entry.file, entry.file.name)
+      formData.append('relativePaths', entry.relativePath)
+    }
+
+    const result = await uploadFormDataWithProgress('/api/ssh/files/upload', formData, {
+      onUploadReady: () => {
+        fileUploadStage.value = 'syncing'
+        startUploadProgressPolling(uploadId)
+      },
+    })
+    stopUploadProgressPolling()
+    fileUploadProgress.value = 100
+    fileUploadTransferred.value = fileUploadTotal.value
+
+    writeNotice(result.message || '文件上传完成。', 'success')
+    await loadFiles(currentDirectory.value, {
+      force: true,
+      preferCache: false,
+      preserveScroll: true,
+    })
+  }
+  catch (error) {
+    stopUploadProgressPolling()
+    const message = error instanceof Error ? error.message : '文件上传失败。'
+    if (message !== '文件上传已取消。') {
+      fileError.value = message
+      writeNotice(message, 'error')
+    }
+  }
+  finally {
+    fileUploadPending.value = false
+    fileUploadMessage.value = ''
+    fileUploadStage.value = 'idle'
+    fileUploadProgress.value = 0
+    fileUploadTransferred.value = 0
+    fileUploadTotal.value = 0
+    fileUploadSpeed.value = 0
+  }
+}
+
+function uploadFormDataWithProgress(url, formData, options = {}) {
+  const { onUploadReady } = options
+
+  return new Promise((resolve, reject) => {
+    const request = new XMLHttpRequest()
+    activeUploadRequest = request
+    request.open('POST', url)
+    request.responseType = 'text'
+
+    request.upload.addEventListener('load', () => {
+      onUploadReady?.()
+    })
+
+    request.addEventListener('load', () => {
+      activeUploadRequest = null
+      const response = createJsonResultFromText(request.responseText)
+
+      if (request.status >= 200 && request.status < 300) {
+        resolve(response)
+        return
+      }
+
+      reject(new Error(getErrorMessage(response, '文件上传失败。')))
+    })
+
+    request.addEventListener('error', () => {
+      activeUploadRequest = null
+      reject(new Error('文件上传失败。'))
+    })
+
+    request.addEventListener('abort', () => {
+      activeUploadRequest = null
+      reject(new Error('文件上传已取消。'))
+    })
+
+    request.send(formData)
+  })
+}
+
+function startUploadProgressPolling(uploadId) {
+  stopUploadProgressPolling()
+  lastUploadProgressAt = performance.now()
+  lastUploadProgressWritten = 0
+
+  const poll = async () => {
+    if (!fileUploadPending.value || fileUploadStage.value !== 'syncing') {
+      return
+    }
+
+    try {
+      const response = await fetch(`/api/ssh/files/upload-progress/${encodeURIComponent(uploadId)}`)
+      if (response.ok) {
+        const payload = await tryReadJson(response)
+        const totalBytes = Number(payload.totalBytes) || fileUploadTotal.value
+        const writtenBytes = Math.min(Number(payload.writtenBytes) || 0, totalBytes || 0)
+
+        fileUploadMessage.value = payload.message || fileUploadMessage.value
+        fileUploadTotal.value = totalBytes
+        fileUploadTransferred.value = writtenBytes
+
+        if (totalBytes > 0) {
+          fileUploadProgress.value = Math.min(99, (writtenBytes / totalBytes) * 100)
+        }
+
+        const now = performance.now()
+        const elapsedMs = Math.max(1, now - lastUploadProgressAt)
+        const writtenDelta = Math.max(0, writtenBytes - lastUploadProgressWritten)
+        fileUploadSpeed.value = writtenDelta / (elapsedMs / 1000)
+        lastUploadProgressAt = now
+        lastUploadProgressWritten = writtenBytes
+      }
+    }
+    catch {
+    }
+
+    activeUploadProgressTimer = window.setTimeout(poll, 250)
+  }
+
+  void poll()
+}
+
+function stopUploadProgressPolling() {
+  if (activeUploadProgressTimer) {
+    clearTimeout(activeUploadProgressTimer)
+    activeUploadProgressTimer = 0
+  }
+
+  lastUploadProgressAt = 0
+  lastUploadProgressWritten = 0
+}
+
 function openFileEntry(entry) {
   closeFileContextMenu()
   if (entry?.isDirectory) {
@@ -1105,7 +1594,7 @@ async function handleFileAction(action) {
   const targetEntry = fileContextMenu.entry
   closeFileContextMenu()
 
-  if (fileActionPending.value) {
+  if (isFileBusy.value) {
     return
   }
 
@@ -1271,6 +1760,8 @@ function resetFileBrowserState(directory = defaultDirectory) {
   currentDirectory.value = normalizePreferredDirectory(directory)
   parentDirectory.value = null
   fileEntries.value = []
+  fileDropActive.value = false
+  fileUploadMessage.value = ''
   fileError.value = ''
 }
 
@@ -1383,6 +1874,26 @@ function formatFileSize(size) {
   return `${(size / (1024 * 1024 * 1024)).toFixed(1)} GB`
 }
 
+function formatTransferSpeed(bytesPerSecond) {
+  if (typeof bytesPerSecond !== 'number' || Number.isNaN(bytesPerSecond) || bytesPerSecond <= 0) {
+    return ''
+  }
+
+  if (bytesPerSecond < 1024) {
+    return `${Math.round(bytesPerSecond)} B/s`
+  }
+
+  if (bytesPerSecond < 1024 * 1024) {
+    return `${(bytesPerSecond / 1024).toFixed(1)} KB/s`
+  }
+
+  if (bytesPerSecond < 1024 * 1024 * 1024) {
+    return `${(bytesPerSecond / (1024 * 1024)).toFixed(1)} MB/s`
+  }
+
+  return `${(bytesPerSecond / (1024 * 1024 * 1024)).toFixed(2)} GB/s`
+}
+
 function formatDate(value) {
   if (!value) {
     return '--'
@@ -1478,6 +1989,10 @@ function combinePath(directoryPath, name) {
 async function tryReadJson(response) {
   const text = await response.text()
 
+  return createJsonResultFromText(text)
+}
+
+function createJsonResultFromText(text) {
   if (!text) {
     return {}
   }
@@ -1653,7 +2168,23 @@ function getErrorMessage(payload, fallback) {
 
           <div class="file-browser-actions">
             <button
-              :disabled="!parentDirectory || filesLoading || fileActionPending"
+              :disabled="!canBrowseFiles || isFileBusy"
+              class="ghost-button"
+              type="button"
+              @click="triggerFileUpload"
+            >
+              上传文件
+            </button>
+            <button
+              :disabled="!canBrowseFiles || isFileBusy"
+              class="ghost-button"
+              type="button"
+              @click="triggerDirectoryUpload"
+            >
+              上传文件夹
+            </button>
+            <button
+              :disabled="!parentDirectory || isFileBusy"
               class="ghost-button"
               type="button"
               @click="openParentDirectory"
@@ -1661,7 +2192,7 @@ function getErrorMessage(payload, fallback) {
               上一级
             </button>
             <button
-              :disabled="!canBrowseFiles || filesLoading || fileActionPending"
+              :disabled="!canBrowseFiles || isFileBusy"
               class="ghost-button"
               type="button"
               @click="loadFiles(currentDirectory, { preserveScroll: true, force: true })"
@@ -1673,9 +2204,16 @@ function getErrorMessage(payload, fallback) {
 
         <div
           ref="fileTableWrap"
-          :class="{ 'file-table-wrap-loading': filesLoading && fileEntries.length > 0 }"
+          :class="{
+            'file-table-wrap-loading': filesLoading && fileEntries.length > 0,
+            'file-table-wrap-drop-active': fileDropActive,
+          }"
           class="file-table-wrap"
           @contextmenu.prevent="openFileContextMenu($event, null)"
+          @dragenter="handleFileDragEnter"
+          @dragover="handleFileDragOver"
+          @dragleave="handleFileDragLeave"
+          @drop="handleFileDrop"
         >
           <div v-if="filesLoading && !fileEntries.length" class="file-state">
             正在读取远程文件...
@@ -1778,10 +2316,46 @@ function getErrorMessage(payload, fallback) {
             正在同步目录...
           </div>
 
+          <div v-if="fileUploadPending" class="file-upload-overlay">
+            <div class="file-upload-meta">
+              <strong>{{ fileUploadStageLabel }}</strong>
+              <span v-if="fileUploadStage === 'syncing'">{{ fileUploadProgressPercent }}<template v-if="fileUploadProgressDetail"> · {{ fileUploadProgressDetail }}</template><template v-if="fileUploadSpeedLabel"> · {{ fileUploadSpeedLabel }}</template></span>
+            </div>
+            <div
+              v-if="fileUploadStage === 'syncing'"
+              aria-hidden="true"
+              class="file-upload-progress"
+            >
+              <span :style="{ width: fileUploadProgressPercent }" class="file-upload-progress-bar" />
+            </div>
+          </div>
+
           <div v-if="fileError && fileEntries.length > 0" class="file-inline-error">
             {{ fileError }}
           </div>
+
+          <div v-if="fileDropActive && !fileUploadPending" class="file-drop-overlay">
+            <strong>松手后开始上传</strong>
+            <span>{{ fileDropHint }}</span>
+          </div>
         </div>
+
+        <input
+          ref="uploadFilesInput"
+          class="visually-hidden"
+          type="file"
+          multiple
+          @change="handleFileInputChange"
+        >
+        <input
+          ref="uploadDirectoryInput"
+          class="visually-hidden"
+          type="file"
+          multiple
+          webkitdirectory
+          directory
+          @change="handleDirectoryInputChange"
+        >
       </section>
     </main>
 
@@ -1796,7 +2370,7 @@ function getErrorMessage(payload, fallback) {
         @contextmenu.prevent.stop
       >
         <button
-          :disabled="!fileContextMenu.entry || fileActionPending"
+          :disabled="!fileContextMenu.entry || isFileBusy"
           class="context-menu-item"
           type="button"
           @mousedown.stop
@@ -1805,7 +2379,7 @@ function getErrorMessage(payload, fallback) {
           重命名
         </button>
         <button
-          :disabled="!fileContextMenu.entry || fileActionPending"
+          :disabled="!fileContextMenu.entry || isFileBusy"
           class="context-menu-item context-menu-item-danger"
           type="button"
           @mousedown.stop
@@ -1814,7 +2388,7 @@ function getErrorMessage(payload, fallback) {
           删除
         </button>
         <button
-          :disabled="fileActionPending"
+          :disabled="isFileBusy"
           class="context-menu-item"
           type="button"
           @mousedown.stop
@@ -1823,7 +2397,7 @@ function getErrorMessage(payload, fallback) {
           新建文件
         </button>
         <button
-          :disabled="fileActionPending"
+          :disabled="isFileBusy"
           class="context-menu-item"
           type="button"
           @mousedown.stop

@@ -1,7 +1,9 @@
 using System.Net.WebSockets;
 using System.Text;
 using System.Text.Json;
+using Microsoft.AspNetCore.Http.Features;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.Primitives;
 using Renci.SshNet.Common;
 using ssh.Server.Models;
 using ssh.Server.Services;
@@ -10,6 +12,7 @@ namespace ssh.Server;
 
 public class Program
 {
+    private const long MaxUploadBodySize = 1024L * 1024L * 1024L;
     // WebSocket 消息统一使用 camelCase，方便前端直接按字段名读取。
     private static readonly JsonSerializerOptions WebSocketJsonOptions = new()
     {
@@ -21,10 +24,20 @@ public class Program
     {
         var builder = WebApplication.CreateBuilder(args);
 
+        builder.WebHost.ConfigureKestrel(options =>
+        {
+            // 上传文件和文件夹时允许更大的请求体，避免被默认 30MB 限制拦住。
+            options.Limits.MaxRequestBodySize = MaxUploadBodySize;
+        });
+
         builder.Services.AddControllers();
-        builder.Services.AddOpenApi();
+        builder.Services.Configure<FormOptions>(options =>
+        {
+            options.MultipartBodyLengthLimit = MaxUploadBodySize;
+        });
         // 这些服务会同时被 HTTP API 和 WebSocket 会话使用，注册成单例更合适。
         builder.Services.AddSingleton<SshSessionStore>();
+        builder.Services.AddSingleton<SshUploadProgressStore>();
         builder.Services.AddSingleton<SshFileBrowserService>();
         builder.Services.AddSingleton<SavedSshConnectionStore>();
 
@@ -33,10 +46,15 @@ public class Program
         app.UseDefaultFiles();
         app.MapStaticAssets();
 
-        if (app.Environment.IsDevelopment())
+        app.UseExceptionHandler(errorApp =>
         {
-            app.MapOpenApi();
-        }
+            errorApp.Run(async context =>
+            {
+                context.Response.StatusCode = StatusCodes.Status500InternalServerError;
+                context.Response.ContentType = "application/json; charset=utf-8";
+                await context.Response.WriteAsJsonAsync(new { message = "服务器处理请求时出现异常，但服务仍在运行。" });
+            });
+        });
 
         app.UseWebSockets();
         app.UseAuthorization();
@@ -48,6 +66,8 @@ public class Program
         app.MapPost("/api/ssh/sessions", CreateSessionAsync);
         app.MapPost("/api/ssh/files/list", ListFilesAsync);
         app.MapPost("/api/ssh/files/action", ApplyFileActionAsync);
+        app.MapPost("/api/ssh/files/upload", UploadFilesAsync);
+        app.MapGet("/api/ssh/files/upload-progress/{uploadId}", GetUploadProgressAsync);
         app.Map("/ws/ssh", HandleWebSocketAsync);
         app.MapFallbackToFile("/index.html");
 
@@ -136,6 +156,10 @@ public class Program
             var result = await fileBrowserService.ListAsync(request, cancellationToken);
             return Results.Ok(result);
         }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            return Results.StatusCode(499);
+        }
         catch (SshAuthenticationException)
         {
             return Results.BadRequest(new { message = "文件列表读取失败：SSH 认证失败。" });
@@ -143,6 +167,10 @@ public class Program
         catch (SshConnectionException ex)
         {
             return Results.BadRequest(new { message = $"文件列表读取失败：{ex.Message}" });
+        }
+        catch (SshOperationTimeoutException)
+        {
+            return Results.BadRequest(new { message = "文件列表读取超时，程序未停止，请稍后重试。" });
         }
         catch (SftpPathNotFoundException)
         {
@@ -178,6 +206,10 @@ public class Program
         {
             return Results.BadRequest(new { message = $"文件操作失败：{ex.Message}" });
         }
+        catch (SshOperationTimeoutException)
+        {
+            return Results.BadRequest(new { message = "文件操作超时，程序未停止，请稍后重试。" });
+        }
         catch (SftpPathNotFoundException)
         {
             return Results.BadRequest(new { message = "目标路径不存在。" });
@@ -186,6 +218,55 @@ public class Program
         {
             return Results.BadRequest(new { message = ex.Message });
         }
+    }
+
+    private static async Task<IResult> UploadFilesAsync(
+        HttpRequest httpRequest,
+        SshFileBrowserService fileBrowserService,
+        CancellationToken cancellationToken)
+    {
+        var form = await httpRequest.ReadFormAsync(cancellationToken);
+        var request = BuildUploadRequest(form);
+        var validationErrors = request.Validate();
+        if (validationErrors.Count > 0)
+        {
+            return Results.ValidationProblem(validationErrors);
+        }
+
+        try
+        {
+            var result = await fileBrowserService.UploadAsync(request, cancellationToken);
+            return Results.Ok(result);
+        }
+        catch (SshAuthenticationException)
+        {
+            return Results.BadRequest(new { message = "文件上传失败：SSH 认证失败。" });
+        }
+        catch (SshConnectionException ex)
+        {
+            return Results.BadRequest(new { message = $"文件上传失败：{ex.Message}" });
+        }
+        catch (SshOperationTimeoutException)
+        {
+            return Results.BadRequest(new { message = "文件上传超时，程序未停止，请稍后重试。" });
+        }
+        catch (SftpPathNotFoundException)
+        {
+            return Results.BadRequest(new { message = "上传目标目录不存在。" });
+        }
+        catch (ArgumentException ex)
+        {
+            return Results.BadRequest(new { message = ex.Message });
+        }
+    }
+
+    private static IResult GetUploadProgressAsync(
+        string uploadId,
+        SshUploadProgressStore uploadProgressStore)
+    {
+        return uploadProgressStore.TryGet(uploadId, out var progress)
+            ? Results.Ok(progress)
+            : Results.NotFound();
     }
 
     private static async Task HandleWebSocketAsync(HttpContext context, SshSessionStore sessionStore)
@@ -337,6 +418,45 @@ public class Program
         var json = JsonSerializer.Serialize(message, WebSocketJsonOptions);
         var bytes = Encoding.UTF8.GetBytes(json);
         await webSocket.SendAsync(bytes, WebSocketMessageType.Text, endOfMessage: true, cancellationToken);
+    }
+
+    private static SshFileUploadRequest BuildUploadRequest(IFormCollection form)
+    {
+        var relativePaths = form["relativePaths"];
+        var uploadFiles = form.Files
+            .Select((file, index) => new SshUploadFileItem
+            {
+                File = file,
+                RelativePath = GetFormValue(relativePaths, index, file.FileName)
+            })
+            .ToArray();
+
+        return new SshFileUploadRequest
+        {
+            UploadId = form["uploadId"].ToString(),
+            Host = form["host"].ToString(),
+            Port = ParsePort(form["port"]),
+            Username = form["username"].ToString(),
+            Password = form["password"].ToString(),
+            Path = form["path"].ToString(),
+            Files = uploadFiles,
+            Directories = form["directories"]
+                .Select(value => value?.ToString() ?? string.Empty)
+                .Where(value => !string.IsNullOrWhiteSpace(value))
+                .ToArray()
+        };
+    }
+
+    private static string GetFormValue(StringValues values, int index, string fallback)
+    {
+        return index >= 0 && index < values.Count && !string.IsNullOrWhiteSpace(values[index])
+            ? values[index]!
+            : fallback;
+    }
+
+    private static int ParsePort(string? value)
+    {
+        return int.TryParse(value, out var port) ? port : 0;
     }
 
     private static Dictionary<string, string[]> ValidateSavedConnections(IReadOnlyList<SavedSshConnection> connections)
